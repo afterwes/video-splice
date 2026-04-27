@@ -1,0 +1,5 @@
+gallery-dl/
+CLAUDE.md
+__pycache__/
+.DS_Store
+.claude/
