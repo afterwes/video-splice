@@ -19,7 +19,7 @@ Create a conda environment with Python 3.11 and install dependencies. Using pip 
 ```bash
 conda create -n videosplice python=3.11 numpy=1.26 numba -y
 conda activate videosplice
-pip install moviepy librosa gallery-dl "scenedetect[opencv]" numpy==2.2.*
+pip install moviepy librosa gallery-dl "scenedetect[opencv]" "numpy==2.2.*"
 ```
 
 ## Usage
