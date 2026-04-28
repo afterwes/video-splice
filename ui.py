@@ -9,7 +9,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import threading
 import tkinter as tk
 from argparse import Namespace
-from tkinter import filedialog, messagebox, scrolledtext, font
+from tkinter import filedialog, messagebox, scrolledtext, font, ttk
 
 from video_splice import run_pipeline
 
@@ -256,6 +256,19 @@ class VideoSpliceUI:
         self.generate_frame.bind("<Button-1>", lambda e: self._start_generate())
         self.generate_label.bind("<Button-1>", lambda e: self._start_generate())
 
+        # --- Progress Bar ---
+        style = ttk.Style()
+        style.theme_use("default")
+        style.configure("Custom.Horizontal.TProgressbar",
+                        troughcolor=ENTRY_BG, background=FG, thickness=6)
+        self.progress_var = tk.DoubleVar(value=0.0)
+        self.progress_bar = ttk.Progressbar(
+            container, variable=self.progress_var,
+            maximum=100, mode="determinate",
+            style="Custom.Horizontal.TProgressbar",
+        )
+        self.progress_bar.pack(fill="x", padx=pad_x, pady=(0, 8))
+
         # --- Log ---
         self._divider(container, pad_x)
 
@@ -275,18 +288,29 @@ class VideoSpliceUI:
             wrap="word", insertbackground=FG,
         )
         self.log_text.pack(fill="x")
+        self.log_text.bind("<Enter>", self._bind_log_mousewheel)
+        self.log_text.bind("<Leave>", self._unbind_log_mousewheel)
 
     def _on_canvas_resize(self, event):
         self.canvas.itemconfig(self.canvas_window, width=event.width)
 
     def _bind_mousewheel(self, event):
-        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind_all("<MouseWheel>", self._on_canvas_mousewheel)
 
     def _unbind_mousewheel(self, event):
         self.canvas.unbind_all("<MouseWheel>")
 
-    def _on_mousewheel(self, event):
-        self.canvas.yview_scroll(int(-1 * event.delta), "units")
+    def _on_canvas_mousewheel(self, event):
+        self.canvas.yview_scroll(-event.delta, "units")
+
+    def _bind_log_mousewheel(self, event):
+        self.log_text.bind_all("<MouseWheel>", self._on_log_mousewheel)
+
+    def _unbind_log_mousewheel(self, event):
+        self.log_text.unbind_all("<MouseWheel>")
+
+    def _on_log_mousewheel(self, event):
+        self.log_text.yview_scroll(-event.delta, "units")
 
     def _browse_button(self, parent, command):
         frame = tk.Frame(parent, bg=DIVIDER, padx=1, pady=1)
@@ -435,6 +459,7 @@ class VideoSpliceUI:
         self.generate_label.configure(text="Generating...", fg=BTN_DISABLED_FG)
         self.generate_frame.unbind("<Button-1>")
         self.generate_label.unbind("<Button-1>")
+        self.progress_var.set(0.0)
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", tk.END)
         self.log_text.configure(state="disabled")
@@ -465,26 +490,60 @@ class VideoSpliceUI:
         thread = threading.Thread(target=self._run_pipeline_thread, args=(arguments,), daemon=True)
         thread.start()
 
+    def _poll_log_queue(self):
+        import queue as _queue
+        try:
+            while True:
+                msg = self._log_queue.get_nowait()
+                self._log(msg)
+        except _queue.Empty:
+            pass
+        if self._pipeline_running:
+            self.root.after(100, self._poll_log_queue)
+
     def _run_pipeline_thread(self, arguments):
         import io
         import contextlib
+        import queue
 
-        log_stream = io.StringIO()
+        self._log_queue = queue.Queue()
+        self._pipeline_running = True
+        self.root.after(100, self._poll_log_queue)
+
+        class QueueWriter:
+            def __init__(self, q):
+                self._queue = q
+                self._buffer = ""
+            def write(self, text):
+                self._buffer += text
+                while "\n" in self._buffer:
+                    line, self._buffer = self._buffer.split("\n", 1)
+                    self._queue.put(line)
+            def flush(self):
+                if self._buffer:
+                    self._queue.put(self._buffer)
+                    self._buffer = ""
+
+        writer = QueueWriter(self._log_queue)
+
+        def _on_progress(current, total):
+            pct = (current / total) * 100 if total > 0 else 0
+            self.root.after(0, self.progress_var.set, pct)
 
         try:
-            with contextlib.redirect_stdout(log_stream), contextlib.redirect_stderr(log_stream):
-                run_pipeline(arguments)
-
-            self.root.after(0, self._log, log_stream.getvalue())
+            with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
+                run_pipeline(arguments, progress_callback=_on_progress)
+            writer.flush()
             self.root.after(0, lambda: messagebox.showinfo("Done", f"Generated {arguments.count} video(s) in:\n{arguments.output_dir}"))
         except Exception as e:
             import traceback
+            writer.flush()
             err_msg = str(e)
             err_trace = traceback.format_exc()
-            self.root.after(0, self._log, log_stream.getvalue())
-            self.root.after(0, self._log, f"\nERROR: {err_msg}\n\n{err_trace}")
+            self._log_queue.put(f"\nERROR: {err_msg}\n\n{err_trace}")
             self.root.after(0, lambda: messagebox.showerror("Error", err_msg))
         finally:
+            self._pipeline_running = False
             def _re_enable():
                 self.generate_label.configure(text="Generate", fg=BTN_FG)
                 self.generate_frame.bind("<Button-1>", lambda e: self._start_generate())

@@ -342,6 +342,7 @@ def build_video_clip(shot_tuple, max_clip_duration_seconds):
     source_video = VideoFileClip(str(video_path), audio=False)
 
     if shot_end is not None:
+        shot_end = min(shot_end, source_video.duration)
         shot_duration = shot_end - shot_start
         if shot_duration <= max_clip_duration_seconds:
             trimmed_clip = source_video.subclipped(shot_start, shot_end)
@@ -371,6 +372,7 @@ def _load_bg_video(shot_tuple, total_duration):
     source_video = VideoFileClip(str(video_path), audio=False)
 
     if shot_end is not None:
+        shot_end = min(shot_end, source_video.duration)
         shot_duration = shot_end - shot_start
         segment = source_video.subclipped(shot_start, shot_end)
         if shot_duration >= total_duration:
@@ -1434,20 +1436,51 @@ def find_board_folder(username, board_name):
     return None
 
 
+def _count_remote_pins(pinterest_url):
+    """
+    Use gallery-dl --simulate to count how many pins exist on the board
+    without downloading anything.  Returns the count, or None if the
+    command fails.
+    """
+    result = subprocess.run(
+        ["gallery-dl", "--simulate", pinterest_url],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    return sum(1 for line in result.stdout.splitlines() if line.startswith("#"))
+
+
 def download_pinterest_board(pinterest_url):
     """
     Download all images/videos from a Pinterest board using gallery-dl.
-    Returns the path to the folder where the media was saved.
+    Skips the download if the local folder already has the same number
+    of files as the remote board.  Returns the path to the folder where
+    the media was saved.
     """
     username, board_name = parse_pinterest_url(pinterest_url)
 
-    print(f"\nDownloading Pinterest board: {pinterest_url}")
+    print(f"\nPinterest board: {pinterest_url}")
     print(f"  Username: {username}")
     print(f"  Board name: {board_name}")
+
+    board_folder = find_board_folder(username, board_name)
+    local_count = len(list(board_folder.iterdir())) if board_folder else 0
+
+    print(f"  Checking remote pin count...")
+    remote_count = _count_remote_pins(pinterest_url)
+
+    if remote_count is not None:
+        print(f"  Remote pins: {remote_count}, Local files: {local_count}")
+
+    if remote_count is not None and board_folder and local_count == remote_count:
+        print(f"  Local folder is up to date — skipping download.")
+        print(f"  Using: {board_folder}")
+        return str(board_folder)
+
     print("  Running gallery-dl (this may take a while)...")
 
-    # Count files before download so we can report what's new
-    board_folder = find_board_folder(username, board_name)
     files_before = set(board_folder.iterdir()) if board_folder else set()
 
     result = subprocess.run(
@@ -1456,7 +1489,6 @@ def download_pinterest_board(pinterest_url):
         text=True,
     )
 
-    # Re-resolve board folder after download (may have just been created)
     board_folder = find_board_folder(username, board_name)
     files_after = set(board_folder.iterdir()) if board_folder else set()
 
@@ -1631,11 +1663,18 @@ def parse_command_line_arguments():
 # 7. MAIN — tie everything together
 # ===========================================================================
 
-def run_pipeline(arguments):
+def run_pipeline(arguments, progress_callback=None):
     """
     Run the full video splice pipeline with the given arguments object.
     Can be called from CLI parsing or from the GUI.
+
+    progress_callback, if provided, is called with (current, total) ints
+    at each major pipeline stage so the caller can update a progress bar.
     """
+    def _progress(current, total):
+        if progress_callback:
+            progress_callback(current, total)
+
     global OUTPUT_WIDTH, OUTPUT_HEIGHT
     if getattr(arguments, "landscape", False):
         OUTPUT_WIDTH = 1920
@@ -1668,6 +1707,9 @@ def run_pipeline(arguments):
     print(f"  Resolution   : {OUTPUT_WIDTH}x{OUTPUT_HEIGHT} ({'landscape' if getattr(arguments, 'landscape', False) else 'portrait'})")
     print("=" * 60)
 
+    total_steps = 2 + arguments.count
+    _progress(0, total_steps)
+
     # Discover media files once
     image_paths, video_paths = discover_media_files(input_folder)
 
@@ -1687,6 +1729,8 @@ def run_pipeline(arguments):
     # Analyze videos for scene cuts
     if video_paths:
         detect_shots(video_paths)
+
+    _progress(1, total_steps)
 
     # Load audio duration once
     audio_for_duration_check = AudioFileClip(str(arguments.audio))
@@ -1740,6 +1784,8 @@ def run_pipeline(arguments):
             audio_file_path=arguments.audio,
             output_file_path=output_path,
         )
+
+        _progress(2 + (video_number - starting_number + 1), total_steps)
 
     print(f"\nAll done! Generated {arguments.count} video(s) in {output_dir}/")
 

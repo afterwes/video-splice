@@ -2,7 +2,15 @@
 
 Takes a folder of images and videos (or a Pinterest board), splices them together randomly, and overlays an audio track. Output is a vertical video (1080x1920) whose length matches the audio.
 
-ex: https://www.tiktok.com/@ratcandy8/video/7615027151439498509
+### Examples
+
+Basic clip mode:
+
+<video src="examples/example.mp4" controls width="300"></video>
+
+Sequence mode (kick-synced transitions):
+
+<video src="examples/example_sequence.mp4" controls width="300"></video>
 
 ## Setup
 
