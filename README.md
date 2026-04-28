@@ -137,7 +137,7 @@ python video_splice.py \
 | `-i` / `--input` | Path to folder of images and videos | — |
 | `-p` / `--pinterest` | Pinterest board URL (alternative to `-i`) | — |
 | `-a` / `--audio` | Path to the audio file (.mp3 or .wav) | required |
-| `-o` / `--output-dir` | Directory for output files | `.` |
+| `-o` / `--output-dir` | Directory for output files | `~/Desktop` |
 | `--count` | Number of videos to generate | `1` |
 | `--sequence-mode` | Kick-based sequence editing (overrides clip/image timing) | off |
 | `--landscape` | Output 1920x1080 instead of 1080x1920 | off |
@@ -145,3 +145,4 @@ python video_splice.py \
 | `--image-length` | Seconds per image (non-sequence mode) | `0.1` |
 | `--images-only` | Only use images (non-sequence mode) | off |
 | `--videos-only` | Only use videos (non-sequence mode) | off |
+

@@ -5,7 +5,10 @@ Launch with: python ui.py
 """
 
 import os
+from pathlib import Path
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+import bundle_runtime
+bundle_runtime.setup()
 import threading
 import tkinter as tk
 from argparse import Namespace
@@ -40,7 +43,7 @@ class VideoSpliceUI:
         pad_x = 32
 
         # Scrollable content area
-        self.canvas = tk.Canvas(root, bg=BG, highlightthickness=0)
+        self.canvas = tk.Canvas(root, bg=BG, highlightthickness=0, yscrollincrement=1)
         self.scrollbar = tk.Scrollbar(root, orient="vertical", command=self.canvas.yview)
         self.scroll_frame = tk.Frame(self.canvas, bg=BG)
 
@@ -122,6 +125,10 @@ class VideoSpliceUI:
         # --- Audio ---
         self._divider(container, pad_x)
         self._section_label(container, "Audio", pad_x)
+        tk.Label(
+            container, text="Best results with clips under 30 seconds.",
+            font=self.font_small, bg=BG, fg=MUTED, anchor="w",
+        ).pack(fill="x", padx=pad_x, pady=(0, 4))
 
         audio_row = tk.Frame(container, bg=BG)
         audio_row.pack(fill="x", padx=pad_x, pady=(0, 8))
@@ -153,7 +160,7 @@ class VideoSpliceUI:
             highlightcolor=DIVIDER, highlightbackground=DIVIDER,
             insertbackground=FG, cursor="xterm",
         )
-        self.output_dir_entry.insert(0, ".")
+        self.output_dir_entry.insert(0, str(Path.home() / "Desktop"))
         self.output_dir_entry.pack(side="left", fill="x", expand=True, ipady=6)
         output_browse = self._browse_button(dir_input_row, self._browse_output_dir)
         output_browse.pack(side="left", padx=(10, 0))
@@ -262,12 +269,27 @@ class VideoSpliceUI:
         style.configure("Custom.Horizontal.TProgressbar",
                         troughcolor=ENTRY_BG, background=FG, thickness=6)
         self.progress_var = tk.DoubleVar(value=0.0)
+        self.progress_pct_var = tk.StringVar(value="")
+        self.progress_var.trace_add("write", self._update_progress_label)
+        tk.Label(
+            container, textvariable=self.progress_pct_var,
+            font=self.font_small, bg=BG, fg=MUTED, anchor="w",
+        ).pack(fill="x", padx=pad_x, pady=(4, 2))
         self.progress_bar = ttk.Progressbar(
             container, variable=self.progress_var,
             maximum=100, mode="determinate",
             style="Custom.Horizontal.TProgressbar",
         )
         self.progress_bar.pack(fill="x", padx=pad_x, pady=(0, 8))
+
+        # --- Warning Label ---
+        self.warning_var = tk.StringVar(value="")
+        self.warning_label = tk.Label(
+            container, textvariable=self.warning_var,
+            font=self.font_small, bg=BG, fg="#CC6600",
+            anchor="w", wraplength=580, justify="left",
+        )
+        self.warning_label.pack(fill="x", padx=pad_x, pady=(0, 4))
 
         # --- Log ---
         self._divider(container, pad_x)
@@ -301,16 +323,35 @@ class VideoSpliceUI:
         self.canvas.unbind_all("<MouseWheel>")
 
     def _on_canvas_mousewheel(self, event):
-        self.canvas.yview_scroll(-event.delta, "units")
+        bbox = self.canvas.bbox("all")
+        if not bbox:
+            return
+        content_height = bbox[3] - bbox[1]
+        if content_height <= 0:
+            return
+        shift = (-event.delta * 2) / content_height
+        current = self.canvas.yview()
+        new_pos = max(0.0, min(1.0, current[0] + shift))
+        self.canvas.yview_moveto(new_pos)
 
     def _bind_log_mousewheel(self, event):
+        self._log_user_scrolled = True
         self.log_text.bind_all("<MouseWheel>", self._on_log_mousewheel)
 
     def _unbind_log_mousewheel(self, event):
+        self._log_user_scrolled = False
         self.log_text.unbind_all("<MouseWheel>")
 
     def _on_log_mousewheel(self, event):
-        self.log_text.yview_scroll(-event.delta, "units")
+        self._log_user_scrolled = True
+        current = self.log_text.yview()
+        total_lines = int(self.log_text.index("end-1c").split(".")[0])
+        if total_lines <= 1:
+            return
+        line_fraction = 1.0 / total_lines
+        shift = -event.delta * line_fraction * 0.4
+        new_pos = max(0.0, min(1.0, current[0] + shift))
+        self.log_text.yview_moveto(new_pos)
 
     def _browse_button(self, parent, command):
         frame = tk.Frame(parent, bg=DIVIDER, padx=1, pady=1)
@@ -361,6 +402,13 @@ class VideoSpliceUI:
             self.folder_entry.delete(0, tk.END)
             self.folder_entry.insert(0, path)
 
+    def _update_progress_label(self, *_args):
+        pct = self.progress_var.get()
+        if pct <= 0:
+            self.progress_pct_var.set("")
+        else:
+            self.progress_pct_var.set(f"{int(pct)}%")
+
     def _browse_audio(self):
         path = filedialog.askopenfilename(
             title="Select audio file",
@@ -379,7 +427,8 @@ class VideoSpliceUI:
     def _log(self, message):
         self.log_text.configure(state="normal")
         self.log_text.insert(tk.END, message + "\n")
-        self.log_text.see(tk.END)
+        if not getattr(self, "_log_user_scrolled", False):
+            self.log_text.see(tk.END)
         self.log_text.configure(state="disabled")
 
     def _build_arguments(self):
@@ -460,6 +509,8 @@ class VideoSpliceUI:
         self.generate_frame.unbind("<Button-1>")
         self.generate_label.unbind("<Button-1>")
         self.progress_var.set(0.0)
+        self.warning_var.set("")
+        self._log_user_scrolled = False
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", tk.END)
         self.log_text.configure(state="disabled")
@@ -496,6 +547,8 @@ class VideoSpliceUI:
             while True:
                 msg = self._log_queue.get_nowait()
                 self._log(msg)
+                if msg.startswith("WARNING:"):
+                    self.warning_var.set(msg)
         except _queue.Empty:
             pass
         if self._pipeline_running:
@@ -553,8 +606,8 @@ class VideoSpliceUI:
 
 def main():
     root = tk.Tk()
-    root.geometry("660x960")
-    root.minsize(500, 600)
+    root.geometry("660x760")
+    root.minsize(500, 500)
     VideoSpliceUI(root)
     root.mainloop()
 

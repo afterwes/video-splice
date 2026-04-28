@@ -57,6 +57,8 @@ def discover_media_files(input_folder_path):
     """
     image_paths = []
     video_paths = []
+    images_filtered = 0
+    videos_filtered = 0
 
     # Iterate over every file in the folder (non-recursive, top-level only)
     for entry in Path(input_folder_path).iterdir():
@@ -71,8 +73,10 @@ def discover_media_files(input_folder_path):
             try:
                 with Image.open(str(entry)) as img:
                     if img.width * img.height < 640000:
+                        images_filtered += 1
                         continue
             except Exception:
+                images_filtered += 1
                 continue
             image_paths.append(entry)
         elif file_extension in SUPPORTED_VIDEO_EXTENSIONS:
@@ -81,8 +85,10 @@ def discover_media_files(input_folder_path):
                 w, h = clip.size
                 clip.close()
                 if w * h < 640000:
+                    videos_filtered += 1
                     continue
             except Exception:
+                videos_filtered += 1
                 continue
             video_paths.append(entry)
         # Files with other extensions are silently ignored
@@ -95,6 +101,10 @@ def discover_media_files(input_folder_path):
         sys.exit(1)
 
     print(f"Found {len(image_paths)} image(s) and {len(video_paths)} video(s).")
+    if images_filtered > 0:
+        print(f"  Filtered out {images_filtered} image(s) below 640,000px quality threshold.")
+    if videos_filtered > 0:
+        print(f"  Filtered out {videos_filtered} video(s) below 640,000px quality threshold.")
     return image_paths, video_paths
 
 
@@ -511,6 +521,7 @@ def assemble_clip_sequence(
 
 def _pop_image(image_paths, unused_images):
     if not unused_images:
+        print("WARNING: All images used — repeating from the beginning. Add more images for variety.")
         unused_images.extend(image_paths)
         random.shuffle(unused_images)
     return unused_images.pop()
@@ -528,6 +539,7 @@ def _pop_landscape_image(image_paths, unused_images, allow_square=False, exclude
             if img.width > img.height or (allow_square and img.width == img.height):
                 return candidate
         unused_images.insert(0, candidate)
+    print("WARNING: Not enough landscape images — repeating. Add more landscape images for variety.")
     unused_images.extend(image_paths)
     random.shuffle(unused_images)
     for _ in range(len(unused_images)):
@@ -553,6 +565,7 @@ def _pop_landscape_video(video_paths, unused_videos):
         if w > h:
             return candidate
         unused_videos.insert(0, candidate)
+    print("WARNING: Not enough landscape videos — repeating. Add more landscape videos for variety.")
     unused_videos.extend(_expand_to_shots(video_paths))
     random.shuffle(unused_videos)
     for _ in range(len(unused_videos)):
@@ -573,6 +586,7 @@ def _pop_video(video_paths, unused_videos):
         shots = _expand_to_shots(video_paths)
         if not shots:
             return None
+        print("WARNING: All video shots used — repeating from the beginning. Add more videos for variety.")
         unused_videos.extend(shots)
         random.shuffle(unused_videos)
     return unused_videos.pop()
@@ -586,6 +600,7 @@ def _pop_portrait_image(image_paths, unused_images):
             if img.height > img.width:
                 return candidate
         unused_images.insert(0, candidate)
+    print("WARNING: Not enough portrait images — repeating. Add more portrait images for variety.")
     unused_images.extend(image_paths)
     random.shuffle(unused_images)
     for _ in range(len(unused_images)):
@@ -608,6 +623,7 @@ def _pop_portrait_video(video_paths, unused_videos):
         if h > w:
             return candidate
         unused_videos.insert(0, candidate)
+    print("WARNING: Not enough portrait videos — repeating. Add more portrait videos for variety.")
     unused_videos.extend(_expand_to_shots(video_paths))
     random.shuffle(unused_videos)
     for _ in range(len(unused_videos)):
@@ -1147,6 +1163,156 @@ def build_video_triple_image(timestamps, image_paths, video_paths,
 
 
 # ---------------------------------------------------------------------------
+# Sequence: image_cluster
+#   Consumes 3 transient gaps (4 timestamp points).
+#   Phase 1 (t0→t1): fullscreen image
+#   Phase 2 (t1→t3): images appear every 0.1s clustered around center at
+#                     540px width with random offsets
+# ---------------------------------------------------------------------------
+
+def build_image_cluster(timestamps, image_paths, video_paths,
+                        unused_images, unused_videos):
+    import math
+    t0, t1, t2, t3 = timestamps
+    total_duration = t3 - t0
+
+    bg_path = _pop_image_for_mode(image_paths, unused_images)
+    bg = build_image_clip(bg_path, total_duration)
+
+    cluster_duration = t3 - t1
+    cluster_start = t1 - t0
+    num_overlays = 5
+    interval = cluster_duration / num_overlays
+
+    overlays = []
+    angle_offset = random.uniform(0, 2 * math.pi)
+    for i in range(num_overlays):
+        img_path = _pop_image_for_mode(image_paths, unused_images)
+        raw = ImageClip(str(img_path))
+        orig_w, orig_h = raw.size
+        overlay_w, overlay_h = _overlay_size(orig_w, orig_h)
+        resized = raw.resized((overlay_w, overlay_h))
+
+        appear_time = cluster_start + (i * interval)
+        remaining = total_duration - appear_time
+        if remaining <= 0:
+            break
+        resized = resized.with_duration(remaining).with_start(appear_time)
+
+        angle = angle_offset + i * (2 * math.pi / num_overlays)
+        radius = random.randint(60, 150)
+        cx = (OUTPUT_WIDTH - overlay_w) // 2 + int(math.cos(angle) * radius)
+        cy = (OUTPUT_HEIGHT - overlay_h) // 2 + int(math.sin(angle) * radius)
+        resized = resized.with_position((cx, cy))
+        overlays.append(resized)
+
+    composite = CompositeVideoClip(
+        [bg] + overlays,
+        size=(OUTPUT_WIDTH, OUTPUT_HEIGHT),
+    ).with_duration(total_duration)
+
+    return composite, unused_images, unused_videos
+
+
+# ---------------------------------------------------------------------------
+# Sequence: video_cluster
+#   Consumes 3 transient gaps (4 timestamp points).
+#   Phase 1 (t0→t1): fullscreen video
+#   Phase 2 (t1→t3): images appear every 0.1s clustered around center at
+#                     540px width with random offsets
+# ---------------------------------------------------------------------------
+
+def build_video_cluster(timestamps, image_paths, video_paths,
+                        unused_images, unused_videos):
+    import math
+    t0, t1, t2, t3 = timestamps
+    total_duration = t3 - t0
+
+    video_path = _pop_video_for_mode(video_paths, unused_videos)
+    bg = _load_bg_video(video_path, total_duration)
+
+    cluster_duration = t3 - t1
+    cluster_start = t1 - t0
+    num_overlays = 5
+    interval = cluster_duration / num_overlays
+
+    overlays = []
+    angle_offset = random.uniform(0, 2 * math.pi)
+    for i in range(num_overlays):
+        img_path = _pop_image_for_mode(image_paths, unused_images)
+        raw = ImageClip(str(img_path))
+        orig_w, orig_h = raw.size
+        overlay_w, overlay_h = _overlay_size(orig_w, orig_h)
+        resized = raw.resized((overlay_w, overlay_h))
+
+        appear_time = cluster_start + (i * interval)
+        remaining = total_duration - appear_time
+        if remaining <= 0:
+            break
+        resized = resized.with_duration(remaining).with_start(appear_time)
+
+        angle = angle_offset + i * (2 * math.pi / num_overlays)
+        radius = random.randint(60, 150)
+        cx = (OUTPUT_WIDTH - overlay_w) // 2 + int(math.cos(angle) * radius)
+        cy = (OUTPUT_HEIGHT - overlay_h) // 2 + int(math.sin(angle) * radius)
+        resized = resized.with_position((cx, cy))
+        overlays.append(resized)
+
+    composite = CompositeVideoClip(
+        [bg] + overlays,
+        size=(OUTPUT_WIDTH, OUTPUT_HEIGHT),
+    ).with_duration(total_duration)
+
+    return composite, unused_images, unused_videos
+
+
+# ---------------------------------------------------------------------------
+# Sequence: four_quarters
+#   Consumes 5 transient gaps (6 timestamp points).
+#   Phase 1 (t0→t1): fullscreen image
+#   Phase 2 (t1→t5): quarter image in top-left
+#   Phase 3 (t2→t5): quarter image in bottom-right
+#   Phase 4 (t3→t5): quarter image in top-right
+#   Phase 5 (t4→t5): quarter image in bottom-left
+# ---------------------------------------------------------------------------
+
+def build_four_quarters(timestamps, image_paths, video_paths,
+                        unused_images, unused_videos):
+    t0, t1, t2, t3, t4, t5 = timestamps
+    total_duration = t5 - t0
+
+    bg_path = _pop_image_for_mode(image_paths, unused_images)
+    bg = build_image_clip(bg_path, total_duration)
+
+    quarter_w = OUTPUT_WIDTH // 2
+    quarter_h = OUTPUT_HEIGHT // 2
+
+    positions = [
+        (0, 0),
+        (quarter_w, quarter_h),
+        (quarter_w, 0),
+        (0, quarter_h),
+    ]
+    start_times = [t1, t2, t3, t4]
+
+    overlays = []
+    for pos, start in zip(positions, start_times):
+        img_path = _pop_image_for_mode(image_paths, unused_images)
+        raw = ImageClip(str(img_path))
+        resized = raw.resized((quarter_w, quarter_h))
+        resized = resized.with_duration(t5 - start).with_start(start - t0)
+        resized = resized.with_position(pos)
+        overlays.append(resized)
+
+    composite = CompositeVideoClip(
+        [bg] + overlays,
+        size=(OUTPUT_WIDTH, OUTPUT_HEIGHT),
+    ).with_duration(total_duration)
+
+    return composite, unused_images, unused_videos
+
+
+# ---------------------------------------------------------------------------
 # Sequence registry
 #   Each entry has:
 #     name             — for logging
@@ -1219,6 +1385,30 @@ SEQUENCE_TYPES = [
         "trigger": "kick",
         "requires_video": True,
         "build": build_video_triple_image,
+    },
+    {
+        "name": "image_cluster",
+        "transition_points": 4,
+        "min_gap": 0,
+        "trigger": "kick",
+        "requires_video": False,
+        "build": build_image_cluster,
+    },
+    {
+        "name": "video_cluster",
+        "transition_points": 4,
+        "min_gap": 0,
+        "trigger": "kick",
+        "requires_video": True,
+        "build": build_video_cluster,
+    },
+    {
+        "name": "four_quarters",
+        "transition_points": 6,
+        "min_gap": 0,
+        "trigger": "kick",
+        "requires_video": False,
+        "build": build_four_quarters,
     },
 ]
 
@@ -1379,7 +1569,16 @@ def render_final_video(clip_sequence, audio_file_path, output_file_path):
 #    Download all media from a Pinterest board URL using gallery-dl.
 # ===========================================================================
 
-GALLERY_DL_ROOT = Path("/Users/wesleyolmsted/video-splice/gallery-dl/pinterest")
+def _get_gallery_dl_root():
+    if getattr(sys, "frozen", False):
+        return Path.home() / "Documents" / "VideoSplice" / "gallery-dl" / "pinterest"
+    return Path(__file__).resolve().parent / "gallery-dl" / "pinterest"
+
+GALLERY_DL_ROOT = _get_gallery_dl_root()
+
+
+def _gallery_dl_cmd():
+    return os.environ.get("GALLERY_DL_BINARY", "gallery-dl")
 
 
 def parse_pinterest_url(pinterest_url):
@@ -1443,7 +1642,7 @@ def _count_remote_pins(pinterest_url):
     command fails.
     """
     result = subprocess.run(
-        ["gallery-dl", "--simulate", pinterest_url],
+        [_gallery_dl_cmd(), "--simulate", pinterest_url],
         capture_output=True,
         text=True,
     )
@@ -1483,8 +1682,9 @@ def download_pinterest_board(pinterest_url):
 
     files_before = set(board_folder.iterdir()) if board_folder else set()
 
+    GALLERY_DL_ROOT.mkdir(parents=True, exist_ok=True)
     result = subprocess.run(
-        ["gallery-dl", pinterest_url],
+        [_gallery_dl_cmd(), "-d", str(GALLERY_DL_ROOT.parent.parent), pinterest_url],
         capture_output=True,
         text=True,
     )
@@ -1567,7 +1767,7 @@ def parse_command_line_arguments():
 
     parser.add_argument(
         "-o", "--output-dir",
-        default=".",
+        default=str(Path.home() / "Desktop"),
         help="Directory for output video files (default: current directory)",
     )
 

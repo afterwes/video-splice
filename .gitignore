@@ -3,3 +3,11 @@ CLAUDE.md
 __pycache__/
 .DS_Store
 .claude/
+build/
+build_bin/
+dist/
+*.spec.bak
+build.sh
+build.bat
+bundle_runtime.py
+video_splice.spec
