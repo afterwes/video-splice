@@ -210,7 +210,8 @@ class VideoSpliceUI:
 
         self.images_only_var = tk.BooleanVar()
         self.videos_only_var = tk.BooleanVar()
-        self.beat_sync_var = tk.BooleanVar()
+        self.sequence_mode_var = tk.BooleanVar()
+        self.landscape_var = tk.BooleanVar()
 
         tk.Checkbutton(
             options_row, text="Images only", variable=self.images_only_var,
@@ -227,11 +228,18 @@ class VideoSpliceUI:
         ).pack(side="left", padx=(24, 0))
 
         tk.Checkbutton(
-            options_row, text="Beat sync", variable=self.beat_sync_var,
-            command=self._toggle_beat_sync,
+            options_row, text="Sequence mode", variable=self.sequence_mode_var,
+            command=self._toggle_sequence_mode,
             bg=BG, fg=FG, font=self.font_body, activebackground=BG,
             highlightthickness=0, selectcolor=BG,
         ).pack(side="left", padx=(24, 0))
+
+        tk.Checkbutton(
+            options_row, text="Landscape", variable=self.landscape_var,
+            bg=BG, fg=FG, font=self.font_body, activebackground=BG,
+            highlightthickness=0, selectcolor=BG,
+        ).pack(side="left", padx=(24, 0))
+
 
         # --- Generate Button ---
         self._divider(container, pad_x)
@@ -314,8 +322,8 @@ class VideoSpliceUI:
         if self.videos_only_var.get():
             self.images_only_var.set(False)
 
-    def _toggle_beat_sync(self):
-        if self.beat_sync_var.get():
+    def _toggle_sequence_mode(self):
+        if self.sequence_mode_var.get():
             self.clip_length_entry.configure(state="disabled")
             self.image_length_entry.configure(state="disabled")
         else:
@@ -383,9 +391,9 @@ class VideoSpliceUI:
             messagebox.showerror("Error", "Count must be a whole number of 1 or more.")
             return None
 
-        beat_sync = self.beat_sync_var.get()
+        sequence_mode = self.sequence_mode_var.get()
 
-        if beat_sync:
+        if sequence_mode:
             clip_length = 5.0
             image_length = 3.0
         else:
@@ -414,7 +422,9 @@ class VideoSpliceUI:
             image_length=image_length,
             images_only=self.images_only_var.get(),
             videos_only=self.videos_only_var.get(),
-            beat_sync=beat_sync,
+            sequence_mode=sequence_mode,
+            kick_only=True,
+            landscape=self.landscape_var.get(),
         )
 
     def _start_generate(self):
@@ -438,11 +448,13 @@ class VideoSpliceUI:
         cli_parts.append(f'-o "{arguments.output_dir}"')
         if arguments.count > 1:
             cli_parts.append(f'--count {arguments.count}')
-        if arguments.beat_sync:
-            cli_parts.append('--beat-sync')
+        if arguments.sequence_mode:
+            cli_parts.append('--sequence-mode')
         else:
             cli_parts.append(f'--clip-length {arguments.clip_length}')
             cli_parts.append(f'--image-length {arguments.image_length}')
+        if arguments.landscape:
+            cli_parts.append('--landscape')
         if arguments.images_only:
             cli_parts.append('--images-only')
         elif arguments.videos_only:
@@ -467,9 +479,11 @@ class VideoSpliceUI:
             self.root.after(0, lambda: messagebox.showinfo("Done", f"Generated {arguments.count} video(s) in:\n{arguments.output_dir}"))
         except Exception as e:
             import traceback
+            err_msg = str(e)
+            err_trace = traceback.format_exc()
             self.root.after(0, self._log, log_stream.getvalue())
-            self.root.after(0, self._log, f"\nERROR: {e}\n\n{traceback.format_exc()}")
-            self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+            self.root.after(0, self._log, f"\nERROR: {err_msg}\n\n{err_trace}")
+            self.root.after(0, lambda: messagebox.showerror("Error", err_msg))
         finally:
             def _re_enable():
                 self.generate_label.configure(text="Generate", fg=BTN_FG)
