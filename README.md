@@ -6,7 +6,7 @@ Takes a folder of images and videos (or a Pinterest board), splices them togethe
 
 Basic clip mode:
 
-https://github.com/user-attachments/assets/f32f4401-a48b-4248-ab43-d068c10dd55c
+https://github.com/user-attachments/assets/394c5598-4da5-45c5-bb67-94ebdab5dc8c
 
 Sequence mode (kick-synced transitions):
 
