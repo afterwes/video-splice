@@ -4,13 +4,13 @@ Takes a folder of images and videos (or a Pinterest board), splices them togethe
 
 ### Examples
 
-Basic clip mode:
+Basic clip mode — click to download and play:
 
-<video src="examples/example.mp4" controls width="300"></video>
+[![Basic clip mode](examples/example_thumb.jpg)](examples/example.mp4)
 
-Sequence mode (kick-synced transitions):
+Sequence mode (kick-synced transitions) — click to download and play:
 
-<video src="examples/example_sequence.mp4" controls width="300"></video>
+[![Sequence mode](examples/example_sequence_thumb.jpg)](examples/example_sequence.mp4)
 
 ## Setup
 
