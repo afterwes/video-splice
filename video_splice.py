@@ -15,13 +15,18 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import random
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
+
+import shutil
 
 import librosa
 import numpy as np
 from moviepy import (
     AudioFileClip,
     ColorClip,
+    CompositeAudioClip,
     CompositeVideoClip,
     ImageClip,
     VideoFileClip,
@@ -33,10 +38,11 @@ from moviepy import (
 # ---------------------------------------------------------------------------
 OUTPUT_WIDTH = 1080
 OUTPUT_HEIGHT = 1920
+OUTPUT_FPS = 30
 
 # File extensions we accept, stored as sets for fast lookup
 SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
-SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v"}
+SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".gif"}
 SUPPORTED_AUDIO_EXTENSIONS = {".mp3", ".wav"}
 
 
@@ -72,7 +78,7 @@ def discover_media_files(input_folder_path):
             from PIL import Image
             try:
                 with Image.open(str(entry)) as img:
-                    if img.width * img.height < 640000:
+                    if img.width * img.height < 360000:
                         images_filtered += 1
                         continue
             except Exception:
@@ -84,7 +90,7 @@ def discover_media_files(input_folder_path):
                 clip = VideoFileClip(str(entry), audio=False)
                 w, h = clip.size
                 clip.close()
-                if w * h < 640000:
+                if w * h < 360000:
                     videos_filtered += 1
                     continue
             except Exception:
@@ -102,9 +108,9 @@ def discover_media_files(input_folder_path):
 
     print(f"Found {len(image_paths)} image(s) and {len(video_paths)} video(s).")
     if images_filtered > 0:
-        print(f"  Filtered out {images_filtered} image(s) below 640,000px quality threshold.")
+        print(f"  Filtered out {images_filtered} image(s) below 360,000px quality threshold.")
     if videos_filtered > 0:
-        print(f"  Filtered out {videos_filtered} video(s) below 640,000px quality threshold.")
+        print(f"  Filtered out {videos_filtered} video(s) below 360,000px quality threshold.")
     return image_paths, video_paths
 
 
@@ -127,8 +133,14 @@ def detect_shots(video_paths):
 
     print(f"\nAnalyzing {len(video_paths)} video(s) for scene cuts...")
 
+    skipped = []
     for video_path in video_paths:
-        video = open_video(str(video_path))
+        try:
+            video = open_video(str(video_path))
+        except Exception:
+            print(f"  {video_path.name}: skipped (could not open)")
+            skipped.append(video_path)
+            continue
         scene_manager = SceneManager()
         scene_manager.add_detector(ContentDetector())
         scene_manager.detect_scenes(video)
@@ -143,6 +155,9 @@ def detect_shots(video_paths):
 
         VIDEO_SHOT_MAP[str(video_path)] = shots
         print(f"  {video_path.name}: {len(shots)} shot(s)")
+
+    for path in skipped:
+        video_paths.remove(path)
 
     print(f"  Shot analysis complete.")
 
@@ -170,6 +185,69 @@ def _expand_to_shots(video_paths):
 #    the full frame (no black bars), then center-crop any overflow.
 # ===========================================================================
 
+_SEGMENT_CACHE = {}
+
+def _is_valid_segment(path):
+    """Check that a temp segment file exists and has a readable video stream."""
+    if not os.path.isfile(path) or os.path.getsize(path) < 1024:
+        return False
+    ffmpeg = _get_ffmpeg_path()
+    probe = subprocess.run(
+        [ffmpeg, "-hide_banner", "-i", path],
+        capture_output=True, text=True,
+    )
+    return "Duration: N/A" not in probe.stderr and "Video:" in probe.stderr
+
+
+def _extract_segment(video_path, start, end):
+    """
+    Extract a video segment via ffmpeg and re-encode to constant 30fps.
+    Bypasses moviepy's seeking issues with VFR and B-frame sources.
+    Cached by (path, start, end) so the same segment is never encoded twice.
+    """
+    key = (str(video_path), round(start, 3), round(end, 3) if end is not None else None)
+    if key in _SEGMENT_CACHE:
+        cached = _SEGMENT_CACHE[key]
+        if _is_valid_segment(cached):
+            return VideoFileClip(cached, audio=False)
+        _SEGMENT_CACHE.pop(key)
+
+    ffmpeg = _get_ffmpeg_path()
+    tmp = os.path.join(
+        tempfile.gettempdir(),
+        f"vs_seg_{hash(key) & 0xFFFFFFFF:08x}.mp4",
+    )
+    if os.path.isfile(tmp):
+        os.remove(tmp)
+
+    cmd = [ffmpeg, "-hide_banner", "-y"]
+    if start > 0:
+        cmd += ["-ss", f"{start:.3f}"]
+    cmd += ["-i", str(video_path)]
+    if end is not None:
+        cmd += ["-t", f"{end - start:.3f}"]
+    cmd += ["-an", "-vf", f"fps={OUTPUT_FPS}",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+            "-bf", "0", "-g", str(OUTPUT_FPS),
+            "-movflags", "+faststart",
+            tmp]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 or not _is_valid_segment(tmp):
+        print(f"  WARNING: segment extraction failed for {video_path} "
+              f"[{start:.3f}-{end:.3f}], falling back to moviepy")
+        clip = VideoFileClip(str(video_path), audio=False)
+        if end is not None:
+            end = min(end, clip.duration)
+        start = min(start, clip.duration - 0.1)
+        if end is not None and end > start:
+            clip = clip.subclipped(start, end)
+        return clip
+
+    _SEGMENT_CACHE[key] = tmp
+    return VideoFileClip(tmp, audio=False)
+
+
 def resize_clip_to_fill_frame(clip):
     """
     Force-stretch a moviepy clip to exactly OUTPUT_WIDTH x OUTPUT_HEIGHT.
@@ -194,15 +272,24 @@ MIN_TRANSIENT_GAP = 0.2
 TRANSIENT_DELAY = 0.0
 
 
-def _detect_kicks_beat_track(audio_samples, sample_rate):
+def _detect_kicks_beat_track(audio_samples, sample_rate, user_bpm=None):
     """
     Hybrid kick detection: find the first real kick via onset detection
     in the bass range, get the BPM via beat tracking, then build a
     regular grid of kicks starting from that first real hit.
     """
-    # Step 1: Get BPM from beat tracking on the full signal
-    tempo, _ = librosa.beat.beat_track(y=audio_samples, sr=sample_rate)
-    bpm = float(tempo) if np.ndim(tempo) == 0 else float(tempo[0])
+    # Step 1: Get BPM — use the user-supplied value if provided
+    if user_bpm:
+        bpm = float(user_bpm)
+        print(f"  Using user-supplied BPM: {bpm}")
+    else:
+        tempo, _ = librosa.beat.beat_track(y=audio_samples, sr=sample_rate)
+        bpm = float(tempo) if np.ndim(tempo) == 0 else float(tempo[0])
+        if bpm < 80:
+            print(f"  Detected BPM: {bpm:.1f} (half-time, doubling to {bpm * 2:.1f})")
+            bpm *= 2
+        else:
+            print(f"  Detected BPM: {bpm:.1f}")
     beat_interval = 60.0 / bpm
 
     # Step 2: Find the first real kick via onset detection on bass (30-120Hz)
@@ -265,7 +352,7 @@ def _detect_transients_in_band(audio_samples, sample_rate, freq_low, freq_high,
     return librosa.frames_to_time(onset_frames, sr=sample_rate)
 
 
-def detect_all_transients(audio_file_path, kick_only=False):
+def detect_all_transients(audio_file_path, kick_only=False, user_bpm=None):
     """
     Analyze audio and build a unified transient map.
 
@@ -284,7 +371,7 @@ def detect_all_transients(audio_file_path, kick_only=False):
 
     raw_transients = []
 
-    kick_times = _detect_kicks_beat_track(audio_samples, sample_rate)
+    kick_times = _detect_kicks_beat_track(audio_samples, sample_rate, user_bpm=user_bpm)
     kick_times = kick_times + TRANSIENT_DELAY
     for t in kick_times:
         raw_transients.append((min(float(t), audio_duration), "kick"))
@@ -347,60 +434,71 @@ def build_video_clip(shot_tuple, max_clip_duration_seconds):
     """
     Create a moviepy clip from a shot tuple (path, start, end), trimmed
     to the requested length within the shot's boundaries.
+    Each segment is extracted via ffmpeg to guarantee constant 30fps.
     """
     video_path, shot_start, shot_end = shot_tuple
-    source_video = VideoFileClip(str(video_path), audio=False)
 
     if shot_end is not None:
-        shot_end = min(shot_end, source_video.duration)
         shot_duration = shot_end - shot_start
-        if shot_duration <= max_clip_duration_seconds:
-            trimmed_clip = source_video.subclipped(shot_start, shot_end)
-        else:
+        if shot_duration > max_clip_duration_seconds:
             latest_start = shot_end - max_clip_duration_seconds
-            s = random.uniform(shot_start, latest_start)
-            trimmed_clip = source_video.subclipped(s, s + max_clip_duration_seconds)
+            shot_start = random.uniform(shot_start, latest_start)
+            shot_end = shot_start + max_clip_duration_seconds
     else:
-        source_duration = source_video.duration
-        if source_duration <= max_clip_duration_seconds:
-            trimmed_clip = source_video
+        probe = VideoFileClip(str(video_path), audio=False)
+        dur = probe.duration
+        probe.close()
+        if dur > max_clip_duration_seconds:
+            shot_start = random.uniform(0, dur - max_clip_duration_seconds)
+            shot_end = shot_start + max_clip_duration_seconds
         else:
-            latest_start = source_duration - max_clip_duration_seconds
-            s = random.uniform(0, latest_start)
-            trimmed_clip = source_video.subclipped(s, s + max_clip_duration_seconds)
+            shot_end = dur
 
-    fitted_clip = resize_clip_to_fill_frame(trimmed_clip)
-    return fitted_clip
+    clip = _extract_segment(video_path, shot_start, shot_end)
+    return resize_clip_to_fill_frame(clip)
 
 
 def _load_bg_video(shot_tuple, total_duration):
     """
     Load a background video for a sequence from a shot tuple (path, start, end).
     Uses the shot's time range directly. Loops if the shot is too short.
+    Each segment is extracted via ffmpeg to guarantee constant 30fps.
     """
     video_path, shot_start, shot_end = shot_tuple
-    source_video = VideoFileClip(str(video_path), audio=False)
 
     if shot_end is not None:
-        shot_end = min(shot_end, source_video.duration)
         shot_duration = shot_end - shot_start
-        segment = source_video.subclipped(shot_start, shot_end)
         if shot_duration >= total_duration:
             latest_start = shot_start + (shot_duration - total_duration)
             s = random.uniform(shot_start, latest_start)
-            bg = source_video.subclipped(s, s + total_duration)
+            bg = _extract_segment(video_path, s, s + total_duration)
         else:
+            segment = _extract_segment(video_path, shot_start, shot_end)
+            seg_path = _SEGMENT_CACHE.get(
+                (str(video_path), round(shot_start, 3), round(shot_end, 3)))
             loops_needed = int(total_duration // segment.duration) + 1
-            bg = concatenate_videoclips([segment] * loops_needed)
+            loop_clips = [segment] + [
+                VideoFileClip(seg_path, audio=False) for _ in range(loops_needed - 1)
+            ]
+            bg = concatenate_videoclips(loop_clips, method="chain")
             bg = bg.subclipped(0, total_duration)
-    elif source_video.duration >= total_duration:
-        latest_start = source_video.duration - total_duration
-        s = random.uniform(0, latest_start)
-        bg = source_video.subclipped(s, s + total_duration)
     else:
-        loops_needed = int(total_duration // source_video.duration) + 1
-        bg = concatenate_videoclips([source_video] * loops_needed)
-        bg = bg.subclipped(0, total_duration)
+        probe = VideoFileClip(str(video_path), audio=False)
+        dur = probe.duration
+        probe.close()
+        if dur >= total_duration:
+            s = random.uniform(0, dur - total_duration)
+            bg = _extract_segment(video_path, s, s + total_duration)
+        else:
+            segment = _extract_segment(video_path, 0, dur)
+            seg_path = _SEGMENT_CACHE.get(
+                (str(video_path), 0.0, round(dur, 3)))
+            loops_needed = int(total_duration // segment.duration) + 1
+            loop_clips = [segment] + [
+                VideoFileClip(seg_path, audio=False) for _ in range(loops_needed - 1)
+            ]
+            bg = concatenate_videoclips(loop_clips, method="chain")
+            bg = bg.subclipped(0, total_duration)
     return resize_clip_to_fill_frame(bg)
 
 
@@ -913,12 +1011,12 @@ def build_bottom_top_picture(timestamps, image_paths, video_paths,
         three_quarter_h = OUTPUT_HEIGHT * 3 // 4
 
         img1_top = ImageClip(str(image1_path)).resized((OUTPUT_WIDTH, OUTPUT_HEIGHT))
-        img1_top = img1_top.cropped(y1=quarter_h, y2=three_quarter_h)
+        img1_top = img1_top.cropped(y1=0, y2=half_h)
         img1_top = img1_top.with_duration(phase2_3_duration).with_start(phase2_start)
         img1_top = img1_top.with_position((0, 0))
 
         img2_bottom = ImageClip(str(image2_path)).resized((OUTPUT_WIDTH, OUTPUT_HEIGHT))
-        img2_bottom = img2_bottom.cropped(y1=quarter_h, y2=three_quarter_h)
+        img2_bottom = img2_bottom.cropped(y1=0, y2=half_h)
         img2_bottom = img2_bottom.with_duration(phase2_3_duration).with_start(phase2_start)
         img2_bottom = img2_bottom.with_position((0, half_h))
 
@@ -1181,7 +1279,7 @@ def build_image_cluster(timestamps, image_paths, video_paths,
 
     cluster_duration = t3 - t1
     cluster_start = t1 - t0
-    num_overlays = 5
+    num_overlays = 4
     interval = cluster_duration / num_overlays
 
     overlays = []
@@ -1233,7 +1331,7 @@ def build_video_cluster(timestamps, image_paths, video_paths,
 
     cluster_duration = t3 - t1
     cluster_start = t1 - t0
-    num_overlays = 5
+    num_overlays = 4
     interval = cluster_duration / num_overlays
 
     overlays = []
@@ -1312,6 +1410,47 @@ def build_four_quarters(timestamps, image_paths, video_paths,
     return composite, unused_images, unused_videos
 
 
+# Sequence: video_four_quarters
+#   Consumes 5 transient gaps (6 timestamp points).
+#   Same as four_quarters but starts with a fullscreen video instead of image.
+# ---------------------------------------------------------------------------
+
+def build_video_four_quarters(timestamps, image_paths, video_paths,
+                              unused_images, unused_videos):
+    t0, t1, t2, t3, t4, t5 = timestamps
+    total_duration = t5 - t0
+
+    video_path = _pop_video_for_mode(video_paths, unused_videos)
+    bg = _load_bg_video(video_path, total_duration)
+
+    quarter_w = OUTPUT_WIDTH // 2
+    quarter_h = OUTPUT_HEIGHT // 2
+
+    positions = [
+        (0, 0),
+        (quarter_w, quarter_h),
+        (quarter_w, 0),
+        (0, quarter_h),
+    ]
+    start_times = [t1, t2, t3, t4]
+
+    overlays = []
+    for pos, start in zip(positions, start_times):
+        img_path = _pop_image_for_mode(image_paths, unused_images)
+        raw = ImageClip(str(img_path))
+        resized = raw.resized((quarter_w, quarter_h))
+        resized = resized.with_duration(t5 - start).with_start(start - t0)
+        resized = resized.with_position(pos)
+        overlays.append(resized)
+
+    composite = CompositeVideoClip(
+        [bg] + overlays,
+        size=(OUTPUT_WIDTH, OUTPUT_HEIGHT),
+    ).with_duration(total_duration)
+
+    return composite, unused_images, unused_videos
+
+
 # ---------------------------------------------------------------------------
 # Sequence registry
 #   Each entry has:
@@ -1354,14 +1493,14 @@ SEQUENCE_TYPES = [
         "requires_video": False,
         "build": build_double_picture_in_picture,
     },
-    {
-        "name": "bottom_top_picture",
-        "transition_points": 4,
-        "min_gap": 0,
-        "trigger": "kick",
-        "requires_video": False,
-        "build": build_bottom_top_picture,
-    },
+    # {
+    #     "name": "bottom_top_picture",
+    #     "transition_points": 4,
+    #     "min_gap": 0,
+    #     "trigger": "kick",
+    #     "requires_video": False,
+    #     "build": build_bottom_top_picture,
+    # },
     {
         "name": "video_halved",
         "transition_points": 3,
@@ -1392,6 +1531,7 @@ SEQUENCE_TYPES = [
         "min_gap": 0,
         "trigger": "kick",
         "requires_video": False,
+        "group": "cluster",
         "build": build_image_cluster,
     },
     {
@@ -1400,6 +1540,7 @@ SEQUENCE_TYPES = [
         "min_gap": 0,
         "trigger": "kick",
         "requires_video": True,
+        "group": "cluster",
         "build": build_video_cluster,
     },
     {
@@ -1408,7 +1549,17 @@ SEQUENCE_TYPES = [
         "min_gap": 0,
         "trigger": "kick",
         "requires_video": False,
+        "group": "quarters",
         "build": build_four_quarters,
+    },
+    {
+        "name": "video_four_quarters",
+        "transition_points": 6,
+        "min_gap": 0,
+        "trigger": "kick",
+        "requires_video": True,
+        "group": "quarters",
+        "build": build_video_four_quarters,
     },
 ]
 
@@ -1444,13 +1595,17 @@ def _pick_transition_points(transient_map, start_index, count, min_gap, trigger=
     return points, end_index
 
 
-def assemble_sequence_mode(image_paths, video_paths, transient_map, audio_duration):
+def assemble_sequence_mode(image_paths, video_paths, transient_map, audio_duration,
+                           intro_offset=0.0):
     """
     Build the full clip list using sequence-based editing.
 
     Picks random sequences one at a time, scans the transient map for
     transition points that satisfy each sequence's min_gap requirement,
     then calls the builder. Continues until the transient map is exhausted.
+
+    If intro_offset > 0, a black placeholder clip is prepended for that
+    duration (hidden behind the intro overlay in the final render).
     """
     if not SEQUENCE_TYPES:
         print("ERROR: No sequence types defined yet. Add entries to SEQUENCE_TYPES.")
@@ -1469,12 +1624,14 @@ def assemble_sequence_mode(image_paths, video_paths, transient_map, audio_durati
     transient_index = 0
     seq_num = 0
     remaining_sequences = []
+    used_groups = set()
 
     while transient_index < len(transient_map) - 1:
         if not remaining_sequences:
             remaining_sequences = [
                 s for s in SEQUENCE_TYPES
-                if has_videos or not s.get("requires_video", False)
+                if (has_videos or not s.get("requires_video", False))
+                and (s.get("group") is None or s["group"] not in used_groups)
             ]
             random.shuffle(remaining_sequences)
             if not remaining_sequences:
@@ -1503,12 +1660,21 @@ def assemble_sequence_mode(image_paths, video_paths, transient_map, audio_durati
             )
             all_clips.append(clip)
             transient_index = end_index
+            if sequence.get("group"):
+                used_groups.add(sequence["group"])
             remaining_sequences.pop(i)
             placed = True
             break
 
         if not placed:
             break
+
+    if intro_offset > 0:
+        placeholder = ColorClip(
+            size=(OUTPUT_WIDTH, OUTPUT_HEIGHT), color=(0, 0, 0),
+        ).with_duration(intro_offset)
+        all_clips.insert(0, placeholder)
+        print(f"  Prepended {intro_offset:.1f}s black placeholder for intro overlap")
 
     total_duration = sum(c.duration for c in all_clips) if all_clips else 0
     print(f"\nTotal assembled duration: {total_duration:.1f}s ({len(all_clips)} clips)")
@@ -1520,48 +1686,212 @@ def assemble_sequence_mode(image_paths, video_paths, transient_map, audio_durati
 #    Concatenate all clips, attach the audio, and write to disk.
 # ===========================================================================
 
-def render_final_video(clip_sequence, audio_file_path, output_file_path):
+def _get_ffmpeg_path():
+    """Return the ffmpeg binary path, checking all known locations."""
+    env_path = os.environ.get("FFMPEG_BINARY")
+    if env_path and os.path.isfile(env_path):
+        return env_path
+    system_path = shutil.which("ffmpeg")
+    if system_path:
+        return system_path
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return "ffmpeg"
+
+
+def _detect_hw_encoder():
+    """
+    Probe ffmpeg for hardware-accelerated H.264 encoders.
+
+    Returns (codec, ffmpeg_params) for the best available encoder,
+    or ("libx264", []) as a CPU fallback.
+    """
+    ffmpeg = _get_ffmpeg_path()
+
+    # Ordered by preference: macOS VideoToolbox, NVIDIA NVENC, Intel QSV
+    candidates = [
+        ("h264_videotoolbox", ["-b:v", "15M"]),
+        ("h264_nvenc",        ["-preset", "p4", "-cq", "23"]),
+        ("h264_qsv",         ["-global_quality", "23"]),
+    ]
+
+    try:
+        result = subprocess.run(
+            [ffmpeg, "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=10,
+        )
+        encoder_list = result.stdout
+    except Exception:
+        return "libx264", []
+
+    for codec, params in candidates:
+        if codec in encoder_list:
+            # Verify the encoder actually works with a tiny test encode
+            try:
+                test = subprocess.run(
+                    [ffmpeg, "-hide_banner", "-f", "lavfi", "-i",
+                     "color=black:s=64x64:d=0.1", "-c:v", codec,
+                     "-f", "null", "-"],
+                    capture_output=True, timeout=10,
+                )
+                if test.returncode == 0:
+                    return codec, params
+            except Exception:
+                continue
+
+    return "libx264", []
+
+
+def render_final_video(clip_sequence, audio_file_path, output_file_path,
+                       intro_clip=None, intro_overlap=False, duck_db=-8.0,
+                       render_progress_callback=None):
     """
     Concatenate the clip sequence, overlay the audio, and export the video.
 
-    Steps:
-        1. Concatenate all clips in order into one continuous video.
-        2. Load the audio file.
-        3. Attach the audio to the video (trimmed to video length if needed).
-        4. Write the result to the output file with reasonable encoding settings.
+    If intro_clip is provided and intro_overlap is False, it is prepended
+    with its own audio before the main sequence.
+
+    If intro_overlap is True, the intro clip plays over the beginning of the
+    main sequence. The input audio is ducked by duck_db dB during the intro,
+    then restored to full volume. The intro clip's own audio is mixed on top.
     """
     print("\nConcatenating clips into final video...")
-    # method="compose" handles clips of slightly different sizes gracefully
-    concatenated_video = concatenate_videoclips(clip_sequence, method="compose")
+    for clip in clip_sequence:
+        nframes = round(clip.duration * OUTPUT_FPS)
+        clip.duration = nframes / OUTPUT_FPS
+    concatenated_video = concatenate_videoclips(clip_sequence, method="chain")
+    safety_bg = ColorClip(
+        size=(OUTPUT_WIDTH, OUTPUT_HEIGHT), color=(0, 0, 0),
+    ).with_duration(concatenated_video.duration)
+    concatenated_video = CompositeVideoClip(
+        [safety_bg, concatenated_video],
+        size=(OUTPUT_WIDTH, OUTPUT_HEIGHT),
+    ).with_duration(concatenated_video.duration)
 
-    # Load the audio track
     print(f"Loading audio from: {audio_file_path}")
     audio_track = AudioFileClip(str(audio_file_path))
 
-    # Attach the audio — set the video's audio to our track
-    # If audio is slightly longer than video, subclip it to match
-    final_video_with_audio = concatenated_video.with_audio(
-        audio_track.subclipped(0, concatenated_video.duration)
-    )
+    if intro_clip and intro_overlap:
+        intro_dur = intro_clip.duration
+        print(f"Overlapping intro clip ({intro_dur:.1f}s) with ducked audio ({duck_db} dB)...")
+
+        duck_db = -abs(duck_db)
+        duck_factor = 10 ** (duck_db / 20.0)
+        ducked_section = audio_track.subclipped(0, intro_dur).with_volume_scaled(duck_factor)
+        full_section = audio_track.subclipped(intro_dur, concatenated_video.duration)
+
+        from moviepy import concatenate_audioclips
+        main_audio = concatenate_audioclips([ducked_section, full_section])
+
+        intro_boost = 10 ** (10.0 / 20.0)
+        audio_layers = [main_audio]
+        if intro_clip.audio is not None:
+            audio_layers.append(
+                intro_clip.audio.subclipped(0, intro_dur).with_volume_scaled(intro_boost)
+            )
+        mixed_audio = CompositeAudioClip(audio_layers)
+
+        intro_video_only = intro_clip.without_audio()
+        overlay = CompositeVideoClip(
+            [concatenated_video, intro_video_only.with_position((0, 0))],
+            size=(concatenated_video.w, concatenated_video.h),
+        ).with_duration(concatenated_video.duration)
+
+        final_video_with_audio = overlay.with_audio(mixed_audio)
+    elif intro_clip:
+        final_video_with_audio = concatenated_video.with_audio(
+            audio_track.subclipped(0, concatenated_video.duration)
+        )
+        print(f"Prepending intro clip ({intro_clip.duration:.1f}s)...")
+        intro_boost = 10 ** (10.0 / 20.0)
+        if intro_clip.audio is not None:
+            intro_clip = intro_clip.with_audio(
+                intro_clip.audio.with_volume_scaled(intro_boost)
+            )
+        final_video_with_audio = concatenate_videoclips(
+            [intro_clip, final_video_with_audio], method="compose"
+        )
+    else:
+        final_video_with_audio = concatenated_video.with_audio(
+            audio_track.subclipped(0, concatenated_video.duration)
+        )
+
+    def _add_noise(frame):
+        noise = np.random.randint(-2, 3, frame.shape, dtype=np.int16)
+        return np.clip(frame.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+
+    final_video_with_audio = final_video_with_audio.image_transform(_add_noise)
 
     # Write the output file
     print(f"Rendering to: {output_file_path}")
-    print("This may take a while depending on the video length...\n")
 
-    final_video_with_audio.write_videofile(
-        str(output_file_path),
-        fps=30,                  # 30 frames per second — smooth standard
-        codec="libx264",         # H.264 — widely compatible video codec
-        audio_codec="aac",       # AAC — widely compatible audio codec
-        preset="medium",         # Encoding speed vs quality tradeoff
-        threads=4,               # Use multiple CPU threads for faster encoding
+    codec, hw_params = _detect_hw_encoder()
+    if codec != "libx264":
+        print(f"Using GPU-accelerated encoder: {codec}")
+    else:
+        print("No GPU encoder available — using libx264 (CPU)")
+
+    write_kwargs = dict(
+        fps=OUTPUT_FPS,
+        codec=codec,
+        audio_codec="aac",
+        threads=4,
     )
+
+    extra_params = ["-bf", "0"]
+    if codec == "libx264":
+        write_kwargs["preset"] = "medium"
+    if hw_params:
+        extra_params += hw_params
+    write_kwargs["ffmpeg_params"] = extra_params
+
+    logger = "bar"
+    if render_progress_callback:
+        from proglog import ProgressBarLogger
+
+        class _RenderLogger(ProgressBarLogger):
+            def __init__(self):
+                super().__init__()
+                self._last_logged_pct = -1
+                self._pass = 0
+
+            def bars_callback(self, bar, attr, value, old_value=None):
+                if attr == "total" and old_value is None:
+                    self._pass += 1
+                if attr != "index":
+                    return
+                total = self.bars.get(bar, {}).get("total", 0)
+                if total <= 0:
+                    return
+                frac = value / total
+                if self._pass <= 1:
+                    render_progress_callback(frac * 0.4, 1.0)
+                    pct = int(frac * 100)
+                    if pct >= self._last_logged_pct + 10:
+                        self._last_logged_pct = pct
+                        print(f"  Rendering video: {pct}% ({value}/{total} frames)")
+                else:
+                    render_progress_callback(0.4 + frac * 0.6, 1.0)
+
+            def callback(self, **changes):
+                for key, val in changes.items():
+                    if isinstance(val, str) and val.strip():
+                        print(val)
+
+        logger = _RenderLogger()
+
+    render_start = time.time()
+    final_video_with_audio.write_videofile(str(output_file_path), logger=logger, **write_kwargs)
+    render_elapsed = time.time() - render_start
 
     # Clean up moviepy resources to free memory
     concatenated_video.close()
     audio_track.close()
 
     print(f"\nDone! Output saved to: {output_file_path}")
+    print(f"Render time: {render_elapsed:.1f}s")
 
 
 # ===========================================================================
@@ -1583,15 +1913,26 @@ def _gallery_dl_cmd():
 
 def parse_pinterest_url(pinterest_url):
     """
-    Extract the username and board name from a Pinterest URL, decoding
-    any URL-encoded characters (e.g. %C3%A9 -> é, %E9%9B%A2 -> 離).
+    Extract the username, board name, and optional section from a Pinterest URL.
+    Decodes URL-encoded characters (e.g. %C3%A9 -> é, %E9%9B%A2 -> 離).
+
+    Supports:
+        https://www.pinterest.com/<username>/<board>/
+        https://www.pinterest.com/<username>/<board>/<section>/
     """
-    from urllib.parse import unquote
-    parts = pinterest_url.rstrip("/").split("/")
-    # URL format: https://www.pinterest.com/<username>/<board_name>/
-    username = unquote(parts[-2])
-    board_name = unquote(parts[-1])
-    return username, board_name
+    from urllib.parse import unquote, urlparse
+    path_parts = [p for p in urlparse(pinterest_url).path.strip("/").split("/") if p]
+    if len(path_parts) >= 3:
+        username = unquote(path_parts[0])
+        board_name = unquote(path_parts[1])
+        section = unquote(path_parts[2])
+        return username, board_name, section
+    elif len(path_parts) == 2:
+        username = unquote(path_parts[0])
+        board_name = unquote(path_parts[1])
+        return username, board_name, None
+    else:
+        return unquote(path_parts[-1]) if path_parts else "", "", None
 
 
 def _normalize_board_name(name):
@@ -1605,34 +1946,40 @@ def _normalize_board_name(name):
     return re.sub(r'[^a-z0-9]', '', name.lower())
 
 
-def find_board_folder(username, board_name):
+def find_board_folder(username, board_name, section=None):
     """
-    Locate the gallery-dl download folder for a board. Tries an exact
-    match first, then falls back to normalized fuzzy matching against
-    all folders in the username directory.
+    Locate the gallery-dl download folder for a board (or board section).
+    Tries an exact match first, then falls back to normalized fuzzy matching.
+
+    For sectioned boards, gallery-dl creates:
+        pinterest/<username>/<board>/<section>/
     """
     base_path = GALLERY_DL_ROOT / username
     if not base_path.is_dir():
         return None
 
-    # Try exact match first
-    exact = base_path / board_name
-    if exact.is_dir():
-        return exact
+    def _find_in(parent, name):
+        exact = parent / name
+        if exact.is_dir():
+            return exact
+        target = _normalize_board_name(name)
+        for folder in parent.iterdir():
+            if folder.is_dir() and _normalize_board_name(folder.name) == target:
+                return folder
+        for folder in parent.iterdir():
+            normalized_folder = _normalize_board_name(folder.name)
+            if folder.is_dir() and (target in normalized_folder or normalized_folder in target):
+                return folder
+        return None
 
-    # Fall back to normalized comparison against all folders
-    target = _normalize_board_name(board_name)
-    for folder in base_path.iterdir():
-        if folder.is_dir() and _normalize_board_name(folder.name) == target:
-            return folder
+    board_path = _find_in(base_path, board_name)
+    if board_path is None:
+        return None
 
-    # Substring match — URL slug may be a shortened form of the folder name
-    for folder in base_path.iterdir():
-        normalized_folder = _normalize_board_name(folder.name)
-        if folder.is_dir() and (target in normalized_folder or normalized_folder in target):
-            return folder
+    if section:
+        return _find_in(board_path, section)
 
-    return None
+    return board_path
 
 
 def _count_remote_pins(pinterest_url):
@@ -1651,20 +1998,22 @@ def _count_remote_pins(pinterest_url):
     return sum(1 for line in result.stdout.splitlines() if line.startswith("#"))
 
 
-def download_pinterest_board(pinterest_url):
+def download_pinterest_board(pinterest_url, progress_callback=None, force_refresh=False):
     """
     Download all images/videos from a Pinterest board using gallery-dl.
     Skips the download if the local folder already has the same number
     of files as the remote board.  Returns the path to the folder where
     the media was saved.
     """
-    username, board_name = parse_pinterest_url(pinterest_url)
+    username, board_name, section = parse_pinterest_url(pinterest_url)
 
     print(f"\nPinterest board: {pinterest_url}")
     print(f"  Username: {username}")
     print(f"  Board name: {board_name}")
+    if section:
+        print(f"  Section: {section}")
 
-    board_folder = find_board_folder(username, board_name)
+    board_folder = find_board_folder(username, board_name, section)
     local_count = len(list(board_folder.iterdir())) if board_folder else 0
 
     print(f"  Checking remote pin count...")
@@ -1673,23 +2022,31 @@ def download_pinterest_board(pinterest_url):
     if remote_count is not None:
         print(f"  Remote pins: {remote_count}, Local files: {local_count}")
 
-    if remote_count is not None and board_folder and local_count == remote_count:
+    if remote_count is not None and board_folder and local_count == remote_count and not force_refresh:
         print(f"  Local folder is up to date — skipping download.")
         print(f"  Using: {board_folder}")
         return str(board_folder)
 
+    if force_refresh and board_folder and board_folder.exists():
+        print(f"  Force refresh enabled — clearing local folder and re-downloading.")
+        shutil.rmtree(board_folder, ignore_errors=True)
+        board_folder = None
+        local_count = 0
+
     print("  Running gallery-dl (this may take a while)...")
+    if progress_callback:
+        progress_callback(1, 100)
 
     files_before = set(board_folder.iterdir()) if board_folder else set()
 
     GALLERY_DL_ROOT.mkdir(parents=True, exist_ok=True)
     result = subprocess.run(
-        [_gallery_dl_cmd(), "-d", str(GALLERY_DL_ROOT.parent.parent), pinterest_url],
+        [_gallery_dl_cmd(), "-d", str(GALLERY_DL_ROOT.parent), pinterest_url],
         capture_output=True,
         text=True,
     )
 
-    board_folder = find_board_folder(username, board_name)
+    board_folder = find_board_folder(username, board_name, section)
     files_after = set(board_folder.iterdir()) if board_folder else set()
 
     new_files = files_after - files_before
@@ -1711,8 +2068,11 @@ def download_pinterest_board(pinterest_url):
 
     if not board_folder:
         base_path = GALLERY_DL_ROOT / username
-        available = [f.name for f in base_path.iterdir() if f.is_dir()] if base_path.is_dir() else []
-        print(f"ERROR: Board folder not found for '{board_name}' under '{username}'")
+        board_path = base_path / board_name if base_path.is_dir() else base_path
+        search_path = board_path if section and board_path.is_dir() else base_path
+        available = [f.name for f in search_path.iterdir() if f.is_dir()] if search_path.is_dir() else []
+        label = f"'{section}' under '{username}/{board_name}'" if section else f"'{board_name}' under '{username}'"
+        print(f"ERROR: Board folder not found for {label}")
         print(f"  Available folders: {available}")
         sys.exit(1)
 
@@ -1725,7 +2085,230 @@ def download_pinterest_board(pinterest_url):
 
 
 # ===========================================================================
-# 8. ARGUMENT PARSING
+# 8. YOUTUBE INTRO
+#    Download a clip from YouTube and prepare it as an intro.
+# ===========================================================================
+
+def _yt_dlp_cmd():
+    return os.environ.get("YT_DLP_BINARY", "yt-dlp")
+
+
+def _parse_timestamp(ts):
+    """Parse a timestamp string into seconds. Accepts 'SS', 'M:SS', or 'H:MM:SS'."""
+    parts = ts.strip().split(":")
+    if len(parts) == 1:
+        return float(parts[0])
+    elif len(parts) == 2:
+        return int(parts[0]) * 60 + float(parts[1])
+    elif len(parts) == 3:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    raise ValueError(f"Invalid timestamp format: {ts}")
+
+
+def is_yarn_url(url):
+    """Check if a URL is a yarn.co / getyarn.io clip URL."""
+    from urllib.parse import urlparse
+    host = urlparse(url).hostname or ""
+    return host in ("yarn.co", "www.yarn.co", "getyarn.io", "www.getyarn.io")
+
+
+def download_yarn_clip(url):
+    """Download a video clip from yarn.co / getyarn.io. Returns the file path."""
+    import re
+    import tempfile
+    from urllib.parse import urlparse
+
+    import requests
+
+    cache_dir = Path(tempfile.gettempdir()) / "videosplice_intro"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    for f in cache_dir.iterdir():
+        f.unlink()
+
+    path = urlparse(url).path
+    match = re.search(r'yarn-clip/([a-f0-9-]+)', path)
+    if not match:
+        match = re.search(r'/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})', path)
+    if not match:
+        print(f"ERROR: Could not extract clip ID from Yarn URL: {url}")
+        sys.exit(1)
+
+    clip_id = match.group(1)
+    clip_page_url = f"https://getyarn.io/yarn-clip/{clip_id}"
+    mp4_url = f"https://y.yarn.co/{clip_id}.mp4"
+    output_path = cache_dir / "intro.mp4"
+
+    print(f"\nDownloading Yarn clip: {clip_id}")
+    try:
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/120.0.0.0 Safari/537.36",
+        })
+        session.get(clip_page_url)
+        session.headers.update({"Referer": "https://getyarn.io/"})
+        resp = session.get(mp4_url, stream=True)
+        resp.raise_for_status()
+        with open(output_path, "wb") as f:
+            for chunk in resp.iter_content(8192):
+                f.write(chunk)
+    except Exception as e:
+        print(f"ERROR: Failed to download Yarn clip: {e}")
+        sys.exit(1)
+
+    print(f"  Downloaded to: {output_path}")
+    return str(output_path)
+
+
+def download_intro_video(url):
+    """Download an intro video from YouTube or Yarn. Returns the file path."""
+    if is_yarn_url(url):
+        return download_yarn_clip(url)
+    return download_youtube_video(url)
+
+
+def download_youtube_video(url):
+    """Download a YouTube video at the highest quality. Returns the file path."""
+    import glob
+    import tempfile
+
+    cache_dir = Path(tempfile.gettempdir()) / "videosplice_intro"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Clean previous downloads
+    for f in cache_dir.iterdir():
+        f.unlink()
+
+    output_template = str(cache_dir / "intro.%(ext)s")
+
+    ffmpeg_path = _get_ffmpeg_path()
+
+    cmd = [
+        _yt_dlp_cmd(),
+        "-f", "bestvideo+bestaudio/best",
+        "--merge-output-format", "mp4",
+        "--ffmpeg-location", ffmpeg_path,
+        "-o", output_template,
+        "--no-playlist",
+        url,
+    ]
+
+    print(f"\nDownloading intro video from: {url}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.stdout:
+        print(result.stdout)
+    if result.stderr:
+        print(result.stderr)
+
+    if result.returncode != 0:
+        print("ERROR: Failed to download YouTube video.")
+        sys.exit(1)
+
+    # Find whatever file yt-dlp produced
+    downloaded = list(cache_dir.iterdir())
+    if not downloaded:
+        print("ERROR: Download completed but no file found.")
+        sys.exit(1)
+
+    output_path = downloaded[0]
+    print(f"  Downloaded to: {output_path}")
+    return str(output_path)
+
+
+def prepare_intro_clip(video_path, start_seconds, end_seconds=None, caption_words=None):
+    """Load a video, trim to start/end, scale width to OUTPUT_WIDTH preserving aspect ratio,
+    and center on a black background at OUTPUT_WIDTH x OUTPUT_HEIGHT."""
+    clip = VideoFileClip(video_path, audio=True)
+
+    if end_seconds is None or end_seconds > clip.duration:
+        end_seconds = clip.duration
+
+    clip = clip.subclipped(start_seconds, end_seconds)
+
+    scale = OUTPUT_WIDTH / clip.w
+    new_h = int(clip.h * scale)
+    clip = clip.resized((OUTPUT_WIDTH, new_h))
+
+    bg = ColorClip(size=(OUTPUT_WIDTH, OUTPUT_HEIGHT), color=(0, 0, 0))
+    bg = bg.with_duration(clip.duration)
+
+    y_offset = (OUTPUT_HEIGHT - new_h) // 2
+    clip = clip.with_position((0, y_offset))
+
+    layers = [bg, clip]
+
+    if caption_words:
+        from PIL import Image as PILImage, ImageDraw, ImageFont
+        import numpy as np
+        from moviepy import ImageClip
+        try:
+            caption_font = ImageFont.truetype("Helvetica", 48)
+        except (OSError, IOError):
+            try:
+                caption_font = ImageFont.truetype("Arial", 48)
+            except (OSError, IOError):
+                caption_font = ImageFont.load_default()
+        trimmed_words = [
+            w for w in caption_words
+            if w["end"] > start_seconds and w["start"] < end_seconds
+        ]
+        for w in trimmed_words:
+            w_start = max(0.0, w["start"] - start_seconds)
+            w_end = min(end_seconds - start_seconds, w["end"] - start_seconds)
+            w_dur = w_end - w_start
+            if w_dur <= 0:
+                continue
+            frame = PILImage.new("RGBA", (OUTPUT_WIDTH, OUTPUT_HEIGHT), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(frame)
+            bbox = draw.textbbox((0, 0), w["word"], font=caption_font)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            x = (OUTPUT_WIDTH - tw) // 2 - bbox[0]
+            y = (OUTPUT_HEIGHT - th) // 2 - bbox[1]
+            draw.text((x, y), w["word"], fill=(255, 255, 255, 255), font=caption_font)
+            arr = np.array(frame)
+            mask = ImageClip(arr[:, :, 3] / 255.0, is_mask=True)
+            txt = ImageClip(arr[:, :, :3]).with_mask(mask)
+            txt = txt.with_duration(w_dur).with_start(w_start)
+            layers.append(txt)
+        print(f"  Captions: {len(trimmed_words)} words")
+
+    composite = CompositeVideoClip(layers, size=(OUTPUT_WIDTH, OUTPUT_HEIGHT))
+    composite = composite.with_duration(clip.duration)
+    composite.audio = clip.audio
+
+    if composite.audio is None:
+        print("WARNING: Intro clip has no audio track.")
+    else:
+        print(f"  Intro audio: {composite.audio.duration:.1f}s")
+
+    return composite
+
+
+def _trim_audio(audio_path, start=None, end=None):
+    """Trim audio to the specified range using ffmpeg. Returns path to temp file."""
+    import tempfile
+
+    if start is None and end is None:
+        return str(audio_path)
+
+    ffmpeg = _get_ffmpeg_path()
+    temp_path = str(Path(tempfile.gettempdir()) / "videosplice_trimmed_audio.wav")
+    s = start if start is not None else 0.0
+
+    cmd = [ffmpeg, "-hide_banner", "-y", "-ss", f"{s:.1f}", "-i", str(audio_path)]
+    if end is not None:
+        cmd += ["-t", f"{end - s:.1f}"]
+    cmd.append(temp_path)
+
+    print(f"Trimming audio: {s:.1f}s → {end:.1f}s..." if end else f"Trimming audio: {s:.1f}s → end...")
+    subprocess.run(cmd, capture_output=True, check=True)
+    return temp_path
+
+
+# ===========================================================================
+# 9. ARGUMENT PARSING
 #    Define the CLI interface with argparse.
 # ===========================================================================
 
@@ -1763,6 +2346,20 @@ def parse_command_line_arguments():
         "-a", "--audio",
         required=True,
         help="Path to the audio file (.mp3 or .wav) to use as the soundtrack",
+    )
+
+    parser.add_argument(
+        "--audio-start",
+        type=float,
+        default=None,
+        help="Start time in seconds for audio trimming (default: beginning of file)",
+    )
+
+    parser.add_argument(
+        "--audio-end",
+        type=float,
+        default=None,
+        help="End time in seconds for audio trimming (default: end of file)",
     )
 
     parser.add_argument(
@@ -1819,6 +2416,42 @@ def parse_command_line_arguments():
         help="Output in landscape (1920x1080) instead of portrait (1080x1920).",
     )
 
+    parser.add_argument(
+        "--bpm",
+        type=float,
+        default=None,
+        help="Override auto-detected BPM with a known value (sequence mode only).",
+    )
+
+    parser.add_argument(
+        "--intro-url",
+        help="YouTube URL for an intro clip prepended to the output (sequence mode only).",
+    )
+
+    parser.add_argument(
+        "--intro-start",
+        default="0:00",
+        help="Start timestamp for the intro clip, e.g. '0:30' or '1:15' (default: 0:00).",
+    )
+
+    parser.add_argument(
+        "--intro-end",
+        help="End timestamp for the intro clip, e.g. '0:45' or '1:30'. Required with --intro-url.",
+    )
+
+    parser.add_argument(
+        "--intro-overlap",
+        action="store_true",
+        help="Overlap the intro clip with the beginning of the main video, ducking audio.",
+    )
+
+    parser.add_argument(
+        "--duck-db",
+        type=float,
+        default=-8.0,
+        help="Amount of dB to duck the main audio during intro overlap (default: -8).",
+    )
+
     arguments = parser.parse_args()
 
     # --- Validation ---
@@ -1856,6 +2489,20 @@ def parse_command_line_arguments():
     if arguments.image_length <= 0:
         parser.error("--image-length must be a positive number")
 
+    # Intro clip validation
+    if arguments.intro_url:
+        if not arguments.sequence_mode:
+            parser.error("--intro-url requires --sequence-mode")
+        try:
+            _parse_timestamp(arguments.intro_start)
+        except ValueError:
+            parser.error(f"Invalid --intro-start timestamp: {arguments.intro_start}")
+        if arguments.intro_end:
+            try:
+                _parse_timestamp(arguments.intro_end)
+            except ValueError:
+                parser.error(f"Invalid --intro-end timestamp: {arguments.intro_end}")
+
     return arguments
 
 
@@ -1882,13 +2529,19 @@ def run_pipeline(arguments, progress_callback=None):
 
     # If a Pinterest URL was given, download the board once
     if arguments.pinterest:
-        input_folder = download_pinterest_board(arguments.pinterest)
+        input_folder = download_pinterest_board(
+            arguments.pinterest,
+            progress_callback=progress_callback,
+            force_refresh=getattr(arguments, "force_refresh", False),
+        )
     else:
         input_folder = arguments.input
 
     # Build output filenames from the audio file name
     audio_stem = Path(arguments.audio).stem
     output_dir = arguments.output_dir
+
+    pipeline_start = time.time()
 
     print("=" * 60)
     print("  VIDEO SPLICE — Random Media Montage Generator")
@@ -1907,8 +2560,13 @@ def run_pipeline(arguments, progress_callback=None):
     print(f"  Resolution   : {OUTPUT_WIDTH}x{OUTPUT_HEIGHT} ({'landscape' if getattr(arguments, 'landscape', False) else 'portrait'})")
     print("=" * 60)
 
-    total_steps = 2 + arguments.count
-    _progress(0, total_steps)
+    # Trim audio if start/end specified
+    audio_start = getattr(arguments, "audio_start", None)
+    audio_end = getattr(arguments, "audio_end", None)
+    audio_path = _trim_audio(arguments.audio, audio_start, audio_end)
+
+    PREP_PCT = 5
+    _progress(PREP_PCT if arguments.pinterest else 0, 100)
 
     # Discover media files once
     image_paths, video_paths = discover_media_files(input_folder)
@@ -1930,10 +2588,10 @@ def run_pipeline(arguments, progress_callback=None):
     if video_paths:
         detect_shots(video_paths)
 
-    _progress(1, total_steps)
+    _progress(PREP_PCT, 100)
 
     # Load audio duration once
-    audio_for_duration_check = AudioFileClip(str(arguments.audio))
+    audio_for_duration_check = AudioFileClip(str(audio_path))
     target_total_duration = audio_for_duration_check.duration
     audio_for_duration_check.close()
 
@@ -1942,7 +2600,40 @@ def run_pipeline(arguments, progress_callback=None):
     # Analyze audio once if sequence mode is enabled
     transient_map = None
     if arguments.sequence_mode:
-        transient_map, _ = detect_all_transients(arguments.audio, kick_only=True)
+        user_bpm = getattr(arguments, "bpm", None)
+        transient_map, _ = detect_all_transients(audio_path, kick_only=True, user_bpm=user_bpm)
+
+    # Download and prepare intro clip if requested
+    intro_clip = None
+    intro_url = getattr(arguments, "intro_url", None)
+    if intro_url:
+        pre_downloaded = getattr(arguments, "intro_video_path", None)
+        if pre_downloaded and os.path.isfile(pre_downloaded):
+            intro_video_path = pre_downloaded
+            print(f"  Using pre-downloaded intro video: {intro_video_path}")
+        else:
+            intro_video_path = download_intro_video(intro_url)
+        start_sec = _parse_timestamp(getattr(arguments, "intro_start", "0:00"))
+        intro_end = getattr(arguments, "intro_end", None)
+        end_sec = _parse_timestamp(intro_end) if intro_end else None
+        print(f"  Intro trim: {start_sec:.1f}s - {end_sec:.1f}s" if end_sec else f"  Intro trim: {start_sec:.1f}s - end")
+        caption_words = getattr(arguments, "intro_caption_words", [])
+        intro_clip = prepare_intro_clip(intro_video_path, start_sec, end_sec,
+                                        caption_words=caption_words or None)
+        print(f"  Intro clip ready: {intro_clip.duration:.1f}s")
+
+        if getattr(arguments, "intro_overlap", False):
+            if intro_clip.duration >= target_total_duration:
+                print("ERROR: With --intro-overlap, the audio clip must be longer "
+                      f"than the intro clip ({intro_clip.duration:.1f}s >= {target_total_duration:.1f}s).")
+                sys.exit(1)
+            print(f"  Overlap mode: audio will be ducked {arguments.duck_db} dB for first {intro_clip.duration:.1f}s")
+            if transient_map:
+                original_len = len(transient_map)
+                transient_map = [(t, typ) for t, typ in transient_map if t >= intro_clip.duration]
+                skipped = original_len - len(transient_map)
+                if skipped:
+                    print(f"  Skipped {skipped} beats during intro overlap ({intro_clip.duration:.1f}s)")
 
     # Find the first available number to avoid overwriting existing files
     starting_number = 1
@@ -1959,11 +2650,15 @@ def run_pipeline(arguments, progress_callback=None):
         print(f"{'=' * 60}")
 
         if arguments.sequence_mode:
+            intro_offset = 0.0
+            if intro_clip and getattr(arguments, "intro_overlap", False):
+                intro_offset = intro_clip.duration
             clip_sequence = assemble_sequence_mode(
                 image_paths=image_paths,
                 video_paths=video_paths,
                 transient_map=transient_map,
                 audio_duration=target_total_duration,
+                intro_offset=intro_offset,
             )
         else:
             clip_sequence = assemble_clip_sequence(
@@ -1979,15 +2674,47 @@ def run_pipeline(arguments, progress_callback=None):
                   "or beat detection found too few beats for any sequence.")
             sys.exit(1)
 
+        video_idx = video_number - starting_number
+        render_pct_per_video = (100 - PREP_PCT) / arguments.count
+        base_pct = PREP_PCT + video_idx * render_pct_per_video
+
+        def _render_cb(frac, _):
+            pct = base_pct + frac * render_pct_per_video
+            _progress(int(pct), 100)
+
         render_final_video(
             clip_sequence=clip_sequence,
-            audio_file_path=arguments.audio,
+            audio_file_path=audio_path,
             output_file_path=output_path,
+            intro_clip=intro_clip,
+            intro_overlap=getattr(arguments, "intro_overlap", False),
+            duck_db=getattr(arguments, "duck_db", -8.0),
+            render_progress_callback=_render_cb,
         )
 
-        _progress(2 + (video_number - starting_number + 1), total_steps)
+        _progress(int(base_pct + render_pct_per_video), 100)
 
+    # Clean up downloaded intro video (only if pipeline downloaded it, not pre-downloaded by UI)
+    if intro_clip:
+        intro_clip.close()
+        pre_downloaded = getattr(arguments, "intro_video_path", None)
+        if not pre_downloaded:
+            cache_dir = Path(tempfile.gettempdir()) / "videosplice_intro"
+            if cache_dir.exists():
+                shutil.rmtree(cache_dir, ignore_errors=True)
+                print("Cleaned up downloaded intro video.")
+
+    for seg_path in _SEGMENT_CACHE.values():
+        try:
+            os.remove(seg_path)
+        except OSError:
+            pass
+    _SEGMENT_CACHE.clear()
+
+    total_elapsed = time.time() - pipeline_start
+    minutes, seconds = divmod(total_elapsed, 60)
     print(f"\nAll done! Generated {arguments.count} video(s) in {output_dir}/")
+    print(f"Total time: {int(minutes)}m {seconds:.1f}s")
 
 
 def main():
